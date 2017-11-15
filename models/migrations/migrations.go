@@ -5,25 +5,18 @@
 package migrations
 
 import (
-	"bytes"
-	"encoding/json"
 	"fmt"
-	"io/ioutil"
-	"os"
-	"path"
 	"strings"
 	"time"
 
 	"github.com/Unknwon/com"
 	"github.com/go-xorm/xorm"
-	"gopkg.in/ini.v1"
+	log "gopkg.in/clog.v1"
 
-	"github.com/gogits/gogs/modules/log"
-	"github.com/gogits/gogs/modules/setting"
-	gouuid "github.com/gogits/gogs/modules/uuid"
+	"github.com/gogits/gogs/pkg/tool"
 )
 
-const _MIN_DB_VER = 0
+const _MIN_DB_VER = 10
 
 type Migration interface {
 	Description() string
@@ -49,7 +42,7 @@ func (m *migration) Migrate(x *xorm.Engine) error {
 
 // The version table. Should have only one row with id==1
 type Version struct {
-	Id      int64
+	ID      int64
 	Version int64
 }
 
@@ -57,14 +50,20 @@ type Version struct {
 // If you want to "retire" a migration, remove it from the top of the list and
 // update _MIN_VER_DB accordingly
 var migrations = []Migration{
-	NewMigration("generate collaboration from access", accessToCollaboration),    // V0 -> V1:v0.5.13
-	NewMigration("make authorize 4 if team is owners", ownerTeamUpdate),          // V1 -> V2:v0.5.13
-	NewMigration("refactor access table to use id's", accessRefactor),            // V2 -> V3:v0.5.13
-	NewMigration("generate team-repo from team", teamToTeamRepo),                 // V3 -> V4:v0.5.13
-	NewMigration("fix locale file load panic", fixLocaleFileLoadPanic),           // V4 -> V5:v0.6.0
-	NewMigration("trim action compare URL prefix", trimCommitActionAppUrlPrefix), // V5 -> V6:v0.6.3
-	NewMigration("generate issue-label from issue", issueToIssueLabel),           // V6 -> V7:v0.6.4
-	NewMigration("refactor attachment table", attachmentRefactor),                // V7 -> V8:v0.6.4
+	// v0 -> v4 : before 0.6.0 -> last support 0.7.33
+	// v4 -> v10: before 0.7.0 -> last support 0.9.141
+	NewMigration("generate rands and salt for organizations", generateOrgRandsAndSalt),           // V10 -> V11:v0.8.5
+	NewMigration("convert date to unix timestamp", convertDateToUnix),                            // V11 -> V12:v0.9.2
+	NewMigration("convert LDAP UseSSL option to SecurityProtocol", ldapUseSSLToSecurityProtocol), // V12 -> V13:v0.9.37
+
+	// v13 -> v14:v0.9.87
+	NewMigration("set comment updated with created", setCommentUpdatedWithCreated),
+	// v14 -> v15:v0.9.147
+	NewMigration("generate and migrate Git hooks", generateAndMigrateGitHooks),
+	// v15 -> v16:v0.10.16
+	NewMigration("update repository sizes", updateRepositorySizes),
+	// v16 -> v17:v0.10.31
+	NewMigration("remove invalid protect branch whitelist", removeInvalidProtectBranchWhitelist),
 }
 
 // Migrate database to current version
@@ -73,29 +72,15 @@ func Migrate(x *xorm.Engine) error {
 		return fmt.Errorf("sync: %v", err)
 	}
 
-	currentVersion := &Version{Id: 1}
+	currentVersion := &Version{ID: 1}
 	has, err := x.Get(currentVersion)
 	if err != nil {
 		return fmt.Errorf("get: %v", err)
 	} else if !has {
-		// If the user table does not exist it is a fresh installation and we
-		// can skip all migrations.
-		needsMigration, err := x.IsTableExist("user")
-		if err != nil {
-			return err
-		}
-		if needsMigration {
-			isEmpty, err := x.IsTableEmpty("user")
-			if err != nil {
-				return err
-			}
-			// If the user table is empty it is a fresh installation and we can
-			// skip all migrations.
-			needsMigration = !isEmpty
-		}
-		if !needsMigration {
-			currentVersion.Version = int64(_MIN_DB_VER + len(migrations))
-		}
+		// If the version record does not exist we think
+		// it is a fresh installation and we can skip all migrations.
+		currentVersion.ID = 0
+		currentVersion.Version = int64(_MIN_DB_VER + len(migrations))
 
 		if _, err = x.InsertOne(currentVersion); err != nil {
 			return fmt.Errorf("insert: %v", err)
@@ -103,6 +88,32 @@ func Migrate(x *xorm.Engine) error {
 	}
 
 	v := currentVersion.Version
+	if _MIN_DB_VER > v {
+		log.Fatal(0, `
+Hi there, thank you for using Gogs for so long!
+However, Gogs has stopped supporting auto-migration from your previously installed version.
+But the good news is, it's very easy to fix this problem!
+You can migrate your older database using a previous release, then you can upgrade to the newest version.
+
+Please save following instructions to somewhere and start working:
+
+- If you were using below 0.6.0 (e.g. 0.5.x), download last supported archive from following link:
+	https://github.com/gogits/gogs/releases/tag/v0.7.33
+- If you were using below 0.7.0 (e.g. 0.6.x), download last supported archive from following link:
+	https://github.com/gogits/gogs/releases/tag/v0.9.141
+
+Once finished downloading,
+
+1. Extract the archive and to upgrade steps as usual.
+2. Run it once. To verify, you should see some migration traces.
+3. Once it starts web server successfully, stop it.
+4. Now it's time to put back the release archive you originally intent to upgrade.
+5. Enjoy!
+
+In case you're stilling getting this notice, go through instructions again until it disappears.`)
+		return nil
+	}
+
 	if int(v-_MIN_DB_VER) > len(migrations) {
 		// User downgraded Gogs.
 		currentVersion.Version = int64(len(migrations) + _MIN_DB_VER)
@@ -129,104 +140,32 @@ func sessionRelease(sess *xorm.Session) {
 	sess.Close()
 }
 
-func accessToCollaboration(x *xorm.Engine) (err error) {
-	type Collaboration struct {
-		ID      int64 `xorm:"pk autoincr"`
-		RepoID  int64 `xorm:"UNIQUE(s) INDEX NOT NULL"`
-		UserID  int64 `xorm:"UNIQUE(s) INDEX NOT NULL"`
-		Created time.Time
+func generateOrgRandsAndSalt(x *xorm.Engine) (err error) {
+	type User struct {
+		ID    int64  `xorm:"pk autoincr"`
+		Rands string `xorm:"VARCHAR(10)"`
+		Salt  string `xorm:"VARCHAR(10)"`
 	}
 
-	if err = x.Sync(new(Collaboration)); err != nil {
-		return fmt.Errorf("sync: %v", err)
-	}
-
-	results, err := x.Query("SELECT u.id AS `uid`, a.repo_name AS `repo`, a.mode AS `mode`, a.created as `created` FROM `access` a JOIN `user` u ON a.user_name=u.lower_name")
-	if err != nil {
-		if strings.Contains(err.Error(), "no such column") {
-			return nil
-		}
-		return err
+	orgs := make([]*User, 0, 10)
+	if err = x.Where("type=1").And("rands=''").Find(&orgs); err != nil {
+		return fmt.Errorf("select all organizations: %v", err)
 	}
 
 	sess := x.NewSession()
-	defer sessionRelease(sess)
+	defer sess.Close()
 	if err = sess.Begin(); err != nil {
 		return err
 	}
 
-	offset := strings.Split(time.Now().String(), " ")[2]
-	for _, result := range results {
-		mode := com.StrTo(result["mode"]).MustInt64()
-		// Collaborators must have write access.
-		if mode < 2 {
-			continue
-		}
-
-		userID := com.StrTo(result["uid"]).MustInt64()
-		repoRefName := string(result["repo"])
-
-		var created time.Time
-		switch {
-		case setting.UseSQLite3:
-			created, _ = time.Parse(time.RFC3339, string(result["created"]))
-		case setting.UseMySQL:
-			created, _ = time.Parse("2006-01-02 15:04:05-0700", string(result["created"])+offset)
-		case setting.UsePostgreSQL:
-			created, _ = time.Parse("2006-01-02T15:04:05Z-0700", string(result["created"])+offset)
-		}
-
-		// find owner of repository
-		parts := strings.SplitN(repoRefName, "/", 2)
-		ownerName := parts[0]
-		repoName := parts[1]
-
-		results, err := sess.Query("SELECT u.id as `uid`, ou.uid as `memberid` FROM `user` u LEFT JOIN org_user ou ON ou.org_id=u.id WHERE u.lower_name=?", ownerName)
-		if err != nil {
+	for _, org := range orgs {
+		if org.Rands, err = tool.RandomString(10); err != nil {
 			return err
 		}
-		if len(results) < 1 {
-			continue
-		}
-
-		ownerID := com.StrTo(results[0]["uid"]).MustInt64()
-		if ownerID == userID {
-			continue
-		}
-
-		// test if user is member of owning organization
-		isMember := false
-		for _, member := range results {
-			memberID := com.StrTo(member["memberid"]).MustInt64()
-			// We can skip all cases that a user is member of the owning organization
-			if memberID == userID {
-				isMember = true
-			}
-		}
-		if isMember {
-			continue
-		}
-
-		results, err = sess.Query("SELECT id FROM `repository` WHERE owner_id=? AND lower_name=?", ownerID, repoName)
-		if err != nil {
+		if org.Salt, err = tool.RandomString(10); err != nil {
 			return err
-		} else if len(results) < 1 {
-			continue
 		}
-
-		collaboration := &Collaboration{
-			UserID: userID,
-			RepoID: com.StrTo(results[0]["id"]).MustInt64(),
-		}
-		has, err := sess.Get(collaboration)
-		if err != nil {
-			return err
-		} else if has {
-			continue
-		}
-
-		collaboration.Created = created
-		if _, err = sess.InsertOne(collaboration); err != nil {
+		if _, err = sess.Id(org.ID).Update(org); err != nil {
 			return err
 		}
 	}
@@ -234,375 +173,221 @@ func accessToCollaboration(x *xorm.Engine) (err error) {
 	return sess.Commit()
 }
 
-func ownerTeamUpdate(x *xorm.Engine) (err error) {
-	if _, err := x.Exec("UPDATE `team` SET authorize=4 WHERE lower_name=?", "owners"); err != nil {
-		return fmt.Errorf("update owner team table: %v", err)
+type TAction struct {
+	ID          int64 `xorm:"pk autoincr"`
+	CreatedUnix int64
+}
+
+func (t *TAction) TableName() string { return "action" }
+
+type TNotice struct {
+	ID          int64 `xorm:"pk autoincr"`
+	CreatedUnix int64
+}
+
+func (t *TNotice) TableName() string { return "notice" }
+
+type TComment struct {
+	ID          int64 `xorm:"pk autoincr"`
+	CreatedUnix int64
+}
+
+func (t *TComment) TableName() string { return "comment" }
+
+type TIssue struct {
+	ID           int64 `xorm:"pk autoincr"`
+	DeadlineUnix int64
+	CreatedUnix  int64
+	UpdatedUnix  int64
+}
+
+func (t *TIssue) TableName() string { return "issue" }
+
+type TMilestone struct {
+	ID             int64 `xorm:"pk autoincr"`
+	DeadlineUnix   int64
+	ClosedDateUnix int64
+}
+
+func (t *TMilestone) TableName() string { return "milestone" }
+
+type TAttachment struct {
+	ID          int64 `xorm:"pk autoincr"`
+	CreatedUnix int64
+}
+
+func (t *TAttachment) TableName() string { return "attachment" }
+
+type TLoginSource struct {
+	ID          int64 `xorm:"pk autoincr"`
+	CreatedUnix int64
+	UpdatedUnix int64
+}
+
+func (t *TLoginSource) TableName() string { return "login_source" }
+
+type TPull struct {
+	ID         int64 `xorm:"pk autoincr"`
+	MergedUnix int64
+}
+
+func (t *TPull) TableName() string { return "pull_request" }
+
+type TRelease struct {
+	ID          int64 `xorm:"pk autoincr"`
+	CreatedUnix int64
+}
+
+func (t *TRelease) TableName() string { return "release" }
+
+type TRepo struct {
+	ID          int64 `xorm:"pk autoincr"`
+	CreatedUnix int64
+	UpdatedUnix int64
+}
+
+func (t *TRepo) TableName() string { return "repository" }
+
+type TMirror struct {
+	ID             int64 `xorm:"pk autoincr"`
+	UpdatedUnix    int64
+	NextUpdateUnix int64
+}
+
+func (t *TMirror) TableName() string { return "mirror" }
+
+type TPublicKey struct {
+	ID          int64 `xorm:"pk autoincr"`
+	CreatedUnix int64
+	UpdatedUnix int64
+}
+
+func (t *TPublicKey) TableName() string { return "public_key" }
+
+type TDeployKey struct {
+	ID          int64 `xorm:"pk autoincr"`
+	CreatedUnix int64
+	UpdatedUnix int64
+}
+
+func (t *TDeployKey) TableName() string { return "deploy_key" }
+
+type TAccessToken struct {
+	ID          int64 `xorm:"pk autoincr"`
+	CreatedUnix int64
+	UpdatedUnix int64
+}
+
+func (t *TAccessToken) TableName() string { return "access_token" }
+
+type TUser struct {
+	ID          int64 `xorm:"pk autoincr"`
+	CreatedUnix int64
+	UpdatedUnix int64
+}
+
+func (t *TUser) TableName() string { return "user" }
+
+type TWebhook struct {
+	ID          int64 `xorm:"pk autoincr"`
+	CreatedUnix int64
+	UpdatedUnix int64
+}
+
+func (t *TWebhook) TableName() string { return "webhook" }
+
+func convertDateToUnix(x *xorm.Engine) (err error) {
+	log.Info("This migration could take up to minutes, please be patient.")
+	type Bean struct {
+		ID         int64 `xorm:"pk autoincr"`
+		Created    time.Time
+		Updated    time.Time
+		Merged     time.Time
+		Deadline   time.Time
+		ClosedDate time.Time
+		NextUpdate time.Time
 	}
+
+	var tables = []struct {
+		name string
+		cols []string
+		bean interface{}
+	}{
+		{"action", []string{"created"}, new(TAction)},
+		{"notice", []string{"created"}, new(TNotice)},
+		{"comment", []string{"created"}, new(TComment)},
+		{"issue", []string{"deadline", "created", "updated"}, new(TIssue)},
+		{"milestone", []string{"deadline", "closed_date"}, new(TMilestone)},
+		{"attachment", []string{"created"}, new(TAttachment)},
+		{"login_source", []string{"created", "updated"}, new(TLoginSource)},
+		{"pull_request", []string{"merged"}, new(TPull)},
+		{"release", []string{"created"}, new(TRelease)},
+		{"repository", []string{"created", "updated"}, new(TRepo)},
+		{"mirror", []string{"updated", "next_update"}, new(TMirror)},
+		{"public_key", []string{"created", "updated"}, new(TPublicKey)},
+		{"deploy_key", []string{"created", "updated"}, new(TDeployKey)},
+		{"access_token", []string{"created", "updated"}, new(TAccessToken)},
+		{"user", []string{"created", "updated"}, new(TUser)},
+		{"webhook", []string{"created", "updated"}, new(TWebhook)},
+	}
+
+	for _, table := range tables {
+		log.Info("Converting table: %s", table.name)
+		if err = x.Sync2(table.bean); err != nil {
+			return fmt.Errorf("Sync [table: %s]: %v", table.name, err)
+		}
+
+		offset := 0
+		for {
+			beans := make([]*Bean, 0, 100)
+			if err = x.Sql(fmt.Sprintf("SELECT * FROM `%s` ORDER BY id ASC LIMIT 100 OFFSET %d",
+				table.name, offset)).Find(&beans); err != nil {
+				return fmt.Errorf("select beans [table: %s, offset: %d]: %v", table.name, offset, err)
+			}
+			log.Trace("Table [%s]: offset: %d, beans: %d", table.name, offset, len(beans))
+			if len(beans) == 0 {
+				break
+			}
+			offset += 100
+
+			baseSQL := "UPDATE `" + table.name + "` SET "
+			for _, bean := range beans {
+				valSQLs := make([]string, 0, len(table.cols))
+				for _, col := range table.cols {
+					fieldSQL := ""
+					fieldSQL += col + "_unix = "
+
+					switch col {
+					case "deadline":
+						if bean.Deadline.IsZero() {
+							continue
+						}
+						fieldSQL += com.ToStr(bean.Deadline.Unix())
+					case "created":
+						fieldSQL += com.ToStr(bean.Created.Unix())
+					case "updated":
+						fieldSQL += com.ToStr(bean.Updated.Unix())
+					case "closed_date":
+						fieldSQL += com.ToStr(bean.ClosedDate.Unix())
+					case "merged":
+						fieldSQL += com.ToStr(bean.Merged.Unix())
+					case "next_update":
+						fieldSQL += com.ToStr(bean.NextUpdate.Unix())
+					}
+
+					valSQLs = append(valSQLs, fieldSQL)
+				}
+
+				if len(valSQLs) == 0 {
+					continue
+				}
+
+				if _, err = x.Exec(baseSQL + strings.Join(valSQLs, ",") + " WHERE id = " + com.ToStr(bean.ID)); err != nil {
+					return fmt.Errorf("update bean [table: %s, id: %d]: %v", table.name, bean.ID, err)
+				}
+			}
+		}
+	}
+
 	return nil
-}
-
-func accessRefactor(x *xorm.Engine) (err error) {
-	type (
-		AccessMode int
-		Access     struct {
-			ID     int64 `xorm:"pk autoincr"`
-			UserID int64 `xorm:"UNIQUE(s)"`
-			RepoID int64 `xorm:"UNIQUE(s)"`
-			Mode   AccessMode
-		}
-		UserRepo struct {
-			UserID int64
-			RepoID int64
-		}
-	)
-
-	// We consiously don't start a session yet as we make only reads for now, no writes
-
-	accessMap := make(map[UserRepo]AccessMode, 50)
-
-	results, err := x.Query("SELECT r.id AS `repo_id`, r.is_private AS `is_private`, r.owner_id AS `owner_id`, u.type AS `owner_type` FROM `repository` r LEFT JOIN `user` u ON r.owner_id=u.id")
-	if err != nil {
-		return fmt.Errorf("select repositories: %v", err)
-	}
-	for _, repo := range results {
-		repoID := com.StrTo(repo["repo_id"]).MustInt64()
-		isPrivate := com.StrTo(repo["is_private"]).MustInt() > 0
-		ownerID := com.StrTo(repo["owner_id"]).MustInt64()
-		ownerIsOrganization := com.StrTo(repo["owner_type"]).MustInt() > 0
-
-		results, err := x.Query("SELECT `user_id` FROM `collaboration` WHERE repo_id=?", repoID)
-		if err != nil {
-			return fmt.Errorf("select collaborators: %v", err)
-		}
-		for _, user := range results {
-			userID := com.StrTo(user["user_id"]).MustInt64()
-			accessMap[UserRepo{userID, repoID}] = 2 // WRITE ACCESS
-		}
-
-		if !ownerIsOrganization {
-			continue
-		}
-
-		// The minimum level to add a new access record,
-		// because public repository has implicit open access.
-		minAccessLevel := AccessMode(0)
-		if !isPrivate {
-			minAccessLevel = 1
-		}
-
-		repoString := "$" + string(repo["repo_id"]) + "|"
-
-		results, err = x.Query("SELECT `id`,`authorize`,`repo_ids` FROM `team` WHERE org_id=? AND authorize>? ORDER BY `authorize` ASC", ownerID, int(minAccessLevel))
-		if err != nil {
-			if strings.Contains(err.Error(), "no such column") {
-				return nil
-			}
-			return fmt.Errorf("select teams from org: %v", err)
-		}
-
-		for _, team := range results {
-			if !strings.Contains(string(team["repo_ids"]), repoString) {
-				continue
-			}
-			teamID := com.StrTo(team["id"]).MustInt64()
-			mode := AccessMode(com.StrTo(team["authorize"]).MustInt())
-
-			results, err := x.Query("SELECT `uid` FROM `team_user` WHERE team_id=?", teamID)
-			if err != nil {
-				return fmt.Errorf("select users from team: %v", err)
-			}
-			for _, user := range results {
-				userID := com.StrTo(user["uid"]).MustInt64()
-				accessMap[UserRepo{userID, repoID}] = mode
-			}
-		}
-	}
-
-	// Drop table can't be in a session (at least not in sqlite)
-	if _, err = x.Exec("DROP TABLE `access`"); err != nil {
-		return fmt.Errorf("drop access table: %v", err)
-	}
-
-	// Now we start writing so we make a session
-	sess := x.NewSession()
-	defer sessionRelease(sess)
-	if err = sess.Begin(); err != nil {
-		return err
-	}
-
-	if err = sess.Sync2(new(Access)); err != nil {
-		return fmt.Errorf("sync: %v", err)
-	}
-
-	accesses := make([]*Access, 0, len(accessMap))
-	for ur, mode := range accessMap {
-		accesses = append(accesses, &Access{UserID: ur.UserID, RepoID: ur.RepoID, Mode: mode})
-	}
-
-	if _, err = sess.Insert(accesses); err != nil {
-		return fmt.Errorf("insert accesses: %v", err)
-	}
-
-	return sess.Commit()
-}
-
-func teamToTeamRepo(x *xorm.Engine) error {
-	type TeamRepo struct {
-		ID     int64 `xorm:"pk autoincr"`
-		OrgID  int64 `xorm:"INDEX"`
-		TeamID int64 `xorm:"UNIQUE(s)"`
-		RepoID int64 `xorm:"UNIQUE(s)"`
-	}
-
-	teamRepos := make([]*TeamRepo, 0, 50)
-
-	results, err := x.Query("SELECT `id`,`org_id`,`repo_ids` FROM `team`")
-	if err != nil {
-		if strings.Contains(err.Error(), "no such column") {
-			return nil
-		}
-		return fmt.Errorf("select teams: %v", err)
-	}
-	for _, team := range results {
-		orgID := com.StrTo(team["org_id"]).MustInt64()
-		teamID := com.StrTo(team["id"]).MustInt64()
-
-		// #1032: legacy code can have duplicated IDs for same repository.
-		mark := make(map[int64]bool)
-		for _, idStr := range strings.Split(string(team["repo_ids"]), "|") {
-			repoID := com.StrTo(strings.TrimPrefix(idStr, "$")).MustInt64()
-			if repoID == 0 || mark[repoID] {
-				continue
-			}
-
-			mark[repoID] = true
-			teamRepos = append(teamRepos, &TeamRepo{
-				OrgID:  orgID,
-				TeamID: teamID,
-				RepoID: repoID,
-			})
-		}
-	}
-
-	sess := x.NewSession()
-	defer sessionRelease(sess)
-	if err = sess.Begin(); err != nil {
-		return err
-	}
-
-	if err = sess.Sync2(new(TeamRepo)); err != nil {
-		return fmt.Errorf("sync2: %v", err)
-	} else if _, err = sess.Insert(teamRepos); err != nil {
-		return fmt.Errorf("insert team-repos: %v", err)
-	}
-
-	return sess.Commit()
-}
-
-func fixLocaleFileLoadPanic(_ *xorm.Engine) error {
-	cfg, err := ini.Load(setting.CustomConf)
-	if err != nil {
-		return fmt.Errorf("load custom config: %v", err)
-	}
-
-	cfg.DeleteSection("i18n")
-	if err = cfg.SaveTo(setting.CustomConf); err != nil {
-		return fmt.Errorf("save custom config: %v", err)
-	}
-
-	setting.Langs = strings.Split(strings.Replace(strings.Join(setting.Langs, ","), "fr-CA", "fr-FR", 1), ",")
-	return nil
-}
-
-func trimCommitActionAppUrlPrefix(x *xorm.Engine) error {
-	type PushCommit struct {
-		Sha1        string
-		Message     string
-		AuthorEmail string
-		AuthorName  string
-	}
-
-	type PushCommits struct {
-		Len        int
-		Commits    []*PushCommit
-		CompareUrl string
-	}
-
-	type Action struct {
-		ID      int64  `xorm:"pk autoincr"`
-		Content string `xorm:"TEXT"`
-	}
-
-	results, err := x.Query("SELECT `id`,`content` FROM `action` WHERE `op_type`=?", 5)
-	if err != nil {
-		return fmt.Errorf("select commit actions: %v", err)
-	}
-
-	sess := x.NewSession()
-	defer sessionRelease(sess)
-	if err = sess.Begin(); err != nil {
-		return err
-	}
-
-	var pushCommits *PushCommits
-	for _, action := range results {
-		actID := com.StrTo(string(action["id"])).MustInt64()
-		if actID == 0 {
-			continue
-		}
-
-		pushCommits = new(PushCommits)
-		if err = json.Unmarshal(action["content"], pushCommits); err != nil {
-			return fmt.Errorf("unmarshal action content[%s]: %v", actID, err)
-		}
-
-		infos := strings.Split(pushCommits.CompareUrl, "/")
-		if len(infos) <= 4 {
-			continue
-		}
-		pushCommits.CompareUrl = strings.Join(infos[len(infos)-4:], "/")
-
-		p, err := json.Marshal(pushCommits)
-		if err != nil {
-			return fmt.Errorf("marshal action content[%s]: %v", actID, err)
-		}
-
-		if _, err = sess.Id(actID).Update(&Action{
-			Content: string(p),
-		}); err != nil {
-			return fmt.Errorf("update action[%d]: %v", actID, err)
-		}
-	}
-	return sess.Commit()
-}
-
-func issueToIssueLabel(x *xorm.Engine) error {
-	type IssueLabel struct {
-		ID      int64 `xorm:"pk autoincr"`
-		IssueID int64 `xorm:"UNIQUE(s)"`
-		LabelID int64 `xorm:"UNIQUE(s)"`
-	}
-
-	issueLabels := make([]*IssueLabel, 0, 50)
-	results, err := x.Query("SELECT `id`,`label_ids` FROM `issue`")
-	if err != nil {
-		if strings.Contains(err.Error(), "no such column") {
-			return nil
-		}
-		return fmt.Errorf("select issues: %v", err)
-	}
-	for _, issue := range results {
-		issueID := com.StrTo(issue["id"]).MustInt64()
-
-		// Just in case legacy code can have duplicated IDs for same label.
-		mark := make(map[int64]bool)
-		for _, idStr := range strings.Split(string(issue["label_ids"]), "|") {
-			labelID := com.StrTo(strings.TrimPrefix(idStr, "$")).MustInt64()
-			if labelID == 0 || mark[labelID] {
-				continue
-			}
-
-			mark[labelID] = true
-			issueLabels = append(issueLabels, &IssueLabel{
-				IssueID: issueID,
-				LabelID: labelID,
-			})
-		}
-	}
-
-	sess := x.NewSession()
-	defer sessionRelease(sess)
-	if err = sess.Begin(); err != nil {
-		return err
-	}
-
-	if err = sess.Sync2(new(IssueLabel)); err != nil {
-		return fmt.Errorf("sync2: %v", err)
-	} else if _, err = sess.Insert(issueLabels); err != nil {
-		return fmt.Errorf("insert issue-labels: %v", err)
-	}
-
-	return sess.Commit()
-}
-
-func attachmentRefactor(x *xorm.Engine) error {
-	type Attachment struct {
-		ID   int64  `xorm:"pk autoincr"`
-		UUID string `xorm:"uuid INDEX"`
-
-		// For rename purpose.
-		Path    string `xorm:"-"`
-		NewPath string `xorm:"-"`
-	}
-
-	results, err := x.Query("SELECT * FROM `attachment`")
-	if err != nil {
-		return fmt.Errorf("select attachments: %v", err)
-	}
-
-	attachments := make([]*Attachment, 0, len(results))
-	for _, attach := range results {
-		if !com.IsExist(string(attach["path"])) {
-			// If the attachment is already missing, there is no point to update it.
-			continue
-		}
-		attachments = append(attachments, &Attachment{
-			ID:   com.StrTo(attach["id"]).MustInt64(),
-			UUID: gouuid.NewV4().String(),
-			Path: string(attach["path"]),
-		})
-	}
-
-	sess := x.NewSession()
-	defer sessionRelease(sess)
-	if err = sess.Begin(); err != nil {
-		return err
-	}
-
-	if err = sess.Sync2(new(Attachment)); err != nil {
-		return fmt.Errorf("Sync2: %v", err)
-	}
-
-	// Note: Roll back for rename can be a dead loop,
-	// 	so produces a backup file.
-	var buf bytes.Buffer
-	buf.WriteString("# old path -> new path\n")
-
-	// Update database first because this is where error happens the most often.
-	for _, attach := range attachments {
-		if _, err = sess.Id(attach.ID).Update(attach); err != nil {
-			return err
-		}
-
-		attach.NewPath = path.Join(setting.AttachmentPath, attach.UUID[0:1], attach.UUID[1:2], attach.UUID)
-		buf.WriteString(attach.Path)
-		buf.WriteString("\t")
-		buf.WriteString(attach.NewPath)
-		buf.WriteString("\n")
-	}
-
-	// Then rename attachments.
-	isSucceed := true
-	defer func() {
-		if isSucceed {
-			return
-		}
-
-		dumpPath := path.Join(setting.LogRootPath, "attachment_path.dump")
-		ioutil.WriteFile(dumpPath, buf.Bytes(), 0666)
-		fmt.Println("Fail to rename some attachments, old and new paths are saved into:", dumpPath)
-	}()
-	for _, attach := range attachments {
-		if err = os.MkdirAll(path.Dir(attach.NewPath), os.ModePerm); err != nil {
-			isSucceed = false
-			return err
-		}
-
-		if err = os.Rename(attach.Path, attach.NewPath); err != nil {
-			isSucceed = false
-			return err
-		}
-	}
-
-	return sess.Commit()
 }

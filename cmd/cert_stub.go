@@ -10,18 +10,19 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/codegangsta/cli"
+	"github.com/urfave/cli"
 )
 
-var CmdCert = cli.Command{
-	Name:  "cert",
-	Usage: "Generate self-signed certificate",
-	Description: `Generate a self-signed X.509 certificate for a TLS server. 
-Outputs to 'cert.pem' and 'key.pem' and will overwrite existing files.`,
-	Action: runCert,
+var Cert = cli.Command{
+	Name:        "cert",
+	Usage:       "Generate self-signed certificate",
+	Description: `Please use build tags "cert" to rebuild Gogs in order to have this ability`,
+	Action:      runCert,
 }
 
-func runCert(ctx *cli.Context) {
+func runCert(ctx *cli.Context) error {
 	fmt.Println("Command cert not available, please use build tags 'cert' to rebuild.")
 	os.Exit(1)
+
+	return nil
 }

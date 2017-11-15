@@ -1,11 +1,7 @@
 #!/bin/sh
 
-if ! test -d /data/gogs; then
-    mkdir -p /data/gogs/data /data/gogs/conf /data/gogs/log /data/git
-fi
-
 if ! test -d ~git/.ssh; then
-    mkdir ~git/.ssh
+    mkdir -p ~git/.ssh
     chmod 700 ~git/.ssh
 fi
 
@@ -16,7 +12,12 @@ fi
 
 cd /app/gogs
 
+# Link volumed data with app data
 ln -sf /data/gogs/log  ./log
 ln -sf /data/gogs/data ./data
 
+# Backward Compatibility with Gogs Container v0.6.15
+ln -sf /data/git /home/git
+
 chown -R git:git /data /app/gogs ~git/
+chmod 0755 /data /data/gogs ~git/
